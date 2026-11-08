@@ -1,0 +1,215 @@
+import { Contract, rpc as SorobanRpc } from "@stellar/stellar-sdk";
+import { ok, err, StellarwebErrorCode } from "../shared/response";
+import type { StellarwebResult } from "../shared/response";
+import { toMessage } from "../shared";
+import { createHorizonServer, createSorobanServer } from "../shared/serverFactory";
+
+export interface ContractSnapshot {
+  /** Unique snapshot identifier */
+  id: string;
+  contractId: string;
+  label: string;
+  /** ISO-8601 timestamp when snapshot was taken */
+  timestamp: string;
+  /** Serializable contract state extracted from ledger */
+  state: Record<string, unknown>;
+}
+
+export interface SnapshotDiff {
+  label1: string;
+  label2: string;
+  /** Keys present in snapshot2 but not in snapshot1 */
+  added: Record<string, unknown>;
+  /** Keys present in snapshot1 but not in snapshot2 */
+  removed: Record<string, unknown>;
+  /** Keys whose values differ between the two snapshots */
+  changed: Record<string, { from: unknown; to: unknown }>;
+}
+
+// In-memory snapshot store indexed by label, bounded by a retention policy
+// (#707). Without bounds, long-running apps tracking many contracts grew
+// memory without limit.
+const _snapshots = new Map<string, ContractSnapshot>();
+const _snapshotInsertedAt = new Map<string, number>();
+
+export interface ContractSnapshotRetention {
+  /** Max snapshots retained. Oldest (by insertion) evicted first. Default: 200. */
+  maxSnapshots?: number;
+  /** Max age (ms) before a snapshot is evicted on prune. Omit for no age limit. */
+  maxAgeMs?: number;
+}
+
+let _snapshotRetention: ContractSnapshotRetention = { maxSnapshots: 200 };
+
+/** Configure retention for the in-memory contract snapshot store (#707). */
+export function setContractSnapshotRetention(retention: ContractSnapshotRetention): void {
+  _snapshotRetention = { ...retention };
+  pruneContractSnapshots();
+}
+
+/** Evict snapshots exceeding the retention policy. Returns evicted count. */
+export function pruneContractSnapshots(now: number = Date.now()): number {
+  let evicted = 0;
+  const maxAgeMs = _snapshotRetention.maxAgeMs;
+  if (maxAgeMs !== undefined) {
+    for (const [label, insertedAt] of _snapshotInsertedAt) {
+      if (now - insertedAt > maxAgeMs) {
+        _snapshots.delete(label);
+        _snapshotInsertedAt.delete(label);
+        evicted++;
+      }
+    }
+  }
+  const maxSnapshots = _snapshotRetention.maxSnapshots ?? 200;
+  if (_snapshots.size > maxSnapshots) {
+    const ordered = [..._snapshotInsertedAt.entries()].sort((a, b) => a[1] - b[1]);
+    const excess = _snapshots.size - maxSnapshots;
+    for (let i = 0; i < excess; i++) {
+      const entry = ordered[i];
+      if (!entry) break;
+      _snapshots.delete(entry[0]);
+      _snapshotInsertedAt.delete(entry[0]);
+      evicted++;
+    }
+  }
+  return evicted;
+}
+
+/** Number of snapshots currently retained. */
+export function getContractSnapshotCount(): number {
+  return _snapshots.size;
+}
+
+/** Clear all stored snapshots. Useful for test isolation. */
+export function clearSnapshots(): void {
+  _snapshots.clear();
+  _snapshotInsertedAt.clear();
+}
+
+/** Return all stored snapshots, optionally filtered by contractId. */
+export function listSnapshots(contractId?: string): ContractSnapshot[] {
+  const all = Array.from(_snapshots.values());
+  if (contractId === undefined) return all;
+  return all.filter((s) => s.contractId === contractId);
+}
+
+function extractState(entry: unknown): Record<string, unknown> {
+  try {
+    const contractData = (entry as { val: { contractData: () => unknown } }).val.contractData();
+    const instance = (contractData as { val: () => { instance: () => unknown } }).val().instance();
+    const executable = (instance as { executable: () => unknown }).executable();
+    const execName = (executable as { switch: () => { name: string } }).switch().name;
+
+    if (execName === "contractExecutableWasm") {
+      const wasmHash = (executable as { wasmHash: () => Buffer }).wasmHash();
+      return {
+        executable: "wasm",
+        wasmHash: Buffer.from(wasmHash).toString("hex"),
+      };
+    }
+    if (execName === "contractExecutableStellarAsset") {
+      return { executable: "stellar_asset" };
+    }
+    return { executable: execName };
+  } catch {
+    return {};
+  }
+}
+
+function diffObjects(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): Pick<SnapshotDiff, "added" | "removed" | "changed"> {
+  const added: Record<string, unknown> = {};
+  const removed: Record<string, unknown> = {};
+  const changed: Record<string, { from: unknown; to: unknown }> = {};
+
+  for (const key of Object.keys(b)) {
+    if (!(key in a)) {
+      added[key] = b[key];
+    } else if (JSON.stringify(a[key]) !== JSON.stringify(b[key])) {
+      changed[key] = { from: a[key], to: b[key] };
+    }
+  }
+  for (const key of Object.keys(a)) {
+    if (!(key in b)) {
+      removed[key] = a[key];
+    }
+  }
+
+  return { added, removed, changed };
+}
+
+/**
+ * Capture a snapshot of a contract's current on-chain state.
+ *
+ * Reads the contract instance from the Soroban RPC and stores it under
+ * the given `label`. Re-using the same label overwrites the previous snapshot.
+ * When no label is provided, one is generated from the current timestamp.
+ *
+ * @example
+ * const snap = await snapshotContractState(rpcUrl, networkConfig, contractId, "before-upgrade");
+ */
+export async function snapshotContractState(
+  rpcUrl: string,
+  contractId: string,
+  label?: string,
+): Promise<StellarwebResult<ContractSnapshot>> {
+  const snapshotLabel = label ?? `snapshot-${Date.now()}`;
+  const timestamp = new Date().toISOString();
+  const id = `${contractId.slice(0, 8)}-${Date.now()}`;
+
+  try {
+    const rpc = createSorobanServer(rpcUrl);
+    const contract = new Contract(contractId);
+    const instanceResult = await rpc.getLedgerEntries(contract.getFootprint() as any);
+    const instanceEntry = instanceResult.entries[0];
+
+    const state: Record<string, unknown> = instanceEntry
+      ? extractState(instanceEntry)
+      : {};
+
+    const snapshot: ContractSnapshot = { id, contractId, label: snapshotLabel, timestamp, state };
+    _snapshots.set(snapshotLabel, snapshot);
+    _snapshotInsertedAt.set(snapshotLabel, Date.now());
+    // Enforce retention so the store cannot grow unbounded (#707).
+    pruneContractSnapshots();
+    return ok(snapshot);
+  } catch (cause) {
+    return err(
+      StellarwebErrorCode.CONTRACT_READ_FAILED,
+      `Failed to snapshot contract state: ${toMessage(cause)}`,
+      cause,
+    );
+  }
+}
+
+/**
+ * Compare two stored snapshots and return a structured diff.
+ *
+ * @param label1 - Label of the baseline snapshot.
+ * @param label2 - Label of the comparison snapshot.
+ *
+ * @example
+ * const diff = compareSnapshots("before-upgrade", "after-upgrade");
+ */
+export function compareSnapshots(
+  label1: string,
+  label2: string,
+): StellarwebResult<SnapshotDiff> {
+  const snap1 = _snapshots.get(label1);
+  const snap2 = _snapshots.get(label2);
+
+  if (!snap1) {
+    return err(StellarwebErrorCode.UNKNOWN, `Snapshot not found: ${label1}`);
+  }
+  if (!snap2) {
+    return err(StellarwebErrorCode.UNKNOWN, `Snapshot not found: ${label2}`);
+  }
+
+  return ok({
+    label1,
+    label2,
+    ...diffObjects(snap1.state, snap2.state),
+  });
+}

@@ -1,0 +1,14 @@
+﻿{
+  "name": "stellarweb-contracts",
+  "version": "0.1.0",
+  "description": "Soroban smart contract interaction SDK for Stellarweb",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["stellar", "soroban", "smart-contracts", "blockchain"],
+  "author": "Stellarweb",
+  "license": "MIT"
+}
